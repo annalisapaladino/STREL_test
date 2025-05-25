@@ -1,5 +1,5 @@
 # `TorCheck` 🔥✅
-A fully-differentiable implementation of Signal Temporal Logic semantic trees based on PyTorch
+A fully-differentiable implementation of Spatio-Temporal Reach and Escape Logic (STREL) semantic trees based on PyTorch
 
 ## Install
 ```console
