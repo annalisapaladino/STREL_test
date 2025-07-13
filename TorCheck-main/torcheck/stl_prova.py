@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 
 # ==============================================================================
+# Temporary Version with distance_matrix... more updates to be done
+# ==============================================================================
+
+# ==============================================================================
 # Copyright 2020-* Luca Bortolussi. All Rights Reserved.
 # Copyright 2020-* Laura Nenzi.     All Rights Reserved.
 # Copyright 2020-* AI-CPS Group @ University of Trieste. All Rights Reserved.
@@ -652,723 +656,545 @@ class Since(Node):
 
         return torch.flip(z_flipped, [2])
 
-class DynamicReach(Node):
-    def __init__(
-        self,
-        phi1: Node,
-        phi2: Node,
-        distance_fn: Callable[[Tensor], Tensor],
-        d1: float,
-        d2: Optional[float] = None,
-        beta: float = 10.0,
-        max_iter: int = 10,
-    ):
-        super().__init__()
-        self.phi1 = phi1
-        self.phi2 = phi2
-        self.distance_fn = distance_fn
-        self.d1 = d1
-        self.d2 = float('inf') if d2 is None else d2
-        self.beta = beta
-        self.max_iter = max_iter
-
-    def __str__(self):
-        return f"DynamicReach({self.phi1}, {self.phi2}, d1={self.d1}, d2={self.d2})"
-
-    def time_depth(self):
-        return max(self.phi1.time_depth(), self.phi2.time_depth())
-
-    def _soft_distance_matrix(self, edge_index, edge_dists, N):
-        device = edge_dists.device
-        dist = torch.full((N, N), float("inf"), device=device)
-        dist.fill_diagonal_(0)
-        src, dst = edge_index
-        dist[src, dst] = edge_dists
-
-        for _ in range(self.max_iter):
-            current = dist.unsqueeze(0) + dist.unsqueeze(1)
-            softmin = -torch.logsumexp(-self.beta * current, dim=2) / self.beta
-            dist = torch.minimum(dist, softmin)
-        return dist
-
-    def _build_soft_adjacency(self, phi1_val, edge_index, edge_dists, N):
-        src, dst = edge_index
-        A = torch.zeros(N, N, device=phi1_val.device)
-        A[src, dst] = torch.exp(-self.beta * edge_dists).clamp(min=1e-6)
-        gate = torch.sigmoid(self.beta * phi1_val)
-        return A.unsqueeze(0) * gate.unsqueeze(1) * gate.unsqueeze(2)
-
-    def _quantitative(self, x, edge_index_seq, edge_weight_seq, normalize=False):
-        phi1_val = self.phi1._quantitative(x, normalize).squeeze(1)
-        phi2_val = self.phi2._quantitative(x, normalize).squeeze(1)
-        B, N, T = phi1_val.shape
-
-        results = []
-        for t in range(T):
-            edge_index = edge_index_seq[t]
-            edge_weights = edge_weight_seq[t]
-            edge_dists = self.distance_fn(edge_weights)
-            soft_dist = self._soft_distance_matrix(edge_index, edge_dists, N)
-
-            mask1 = torch.sigmoid(self.beta * (soft_dist - self.d1))
-            mask2 = torch.sigmoid(self.beta * (soft_dist - self.d2))
-            dist_mask = mask1 * (1 - mask2)
-
-            phi1_t = phi1_val[:, :, t]
-            phi2_t = phi2_val[:, :, t]
-            soft_adj = self._build_soft_adjacency(phi1_t, edge_index, edge_dists, N)
-
-            score = phi2_t.clone()
-            for _ in range(self.max_iter):
-                score = torch.maximum(score, torch.bmm(soft_adj, score.unsqueeze(-1)).squeeze(-1))
-
-            denom = dist_mask.sum(1, keepdim=True).clamp(min=1e-6)
-            masked_score = torch.bmm(dist_mask[None].expand(B, -1, -1), score.unsqueeze(-1)).squeeze(-1) / denom
-            results.append(masked_score.unsqueeze(1))
-
-        return torch.cat(results, dim=1).unsqueeze(1)
-
-    def _boolean(self, x, edge_index_seq, edge_weight_seq):
-        phi1_val = self.phi1._quantitative(x).squeeze(1) > 0.5
-        phi2_val = self.phi2._quantitative(x).squeeze(1) > 0.5
-        B, N, T = phi1_val.shape
-
-        results = []
-        for t in range(T):
-            edge_index = edge_index_seq[t]
-            edge_weights = edge_weight_seq[t]
-            edge_dists = self.distance_fn(edge_weights)
-
-            dist = torch.full((N, N), float("inf"), device=x.device)
-            dist.fill_diagonal_(0)
-            src, dst = edge_index
-            dist[src, dst] = edge_dists
-
-            for _ in range(self.max_iter):
-                for i in range(N):
-                    dist[i] = torch.minimum(dist[i], (dist[i].unsqueeze(0) + dist).min(dim=0).values)
-
-            dist_mask = (dist >= self.d1) & (dist <= self.d2)
-            phi1_t = phi1_val[:, :, t]
-            phi2_t = phi2_val[:, :, t]
-
-            score = phi2_t.clone()
-            for _ in range(self.max_iter):
-                phi1_mask = phi1_t.unsqueeze(2) & phi1_t.unsqueeze(1)
-                adj = (dist < float("inf")).to(torch.bool)
-                batch_adj = adj.unsqueeze(0).expand(B, -1, -1) & phi1_mask
-                score = score | (torch.bmm(batch_adj.float(), score.unsqueeze(2).float()).squeeze(2) > 0)
-
-            final = torch.bmm(dist_mask[None].float().expand(B, -1, -1), score.unsqueeze(2).float()).squeeze(2) > 0
-            results.append(final.unsqueeze(1))
-
-        return torch.cat(results, dim=1).unsqueeze(1).float()
-
-class DynamicEscape(Node):
-    def __init__(
-        self,
-        phi: Node,
-        distance_fn: Callable[[Tensor], Tensor],
-        d1: float,
-        d2: Optional[float] = None,
-        beta: float = 10.0,
-        max_iter: int = 10,
-    ):
-        super().__init__()
-        self.phi = phi
-        self.distance_fn = distance_fn
-        self.d1 = d1
-        self.d2 = float('inf') if d2 is None else d2
-        self.beta = beta
-        self.max_iter = max_iter
-
-    def __str__(self):
-        return f"DynamicEscape({self.phi}, d1={self.d1}, d2={self.d2})"
-
-    def time_depth(self):
-        return self.phi.time_depth()
-
-    def _soft_distance_matrix(self, edge_index, edge_dists, N):
-        device = edge_dists.device
-        dist = torch.full((N, N), float("inf"), device=device)
-        dist.fill_diagonal_(0)
-        src, dst = edge_index
-        dist[src, dst] = edge_dists
-
-        for _ in range(self.max_iter):
-            current = dist.unsqueeze(0) + dist.unsqueeze(1)
-            softmin = -torch.logsumexp(-self.beta * current, dim=2) / self.beta
-            dist = torch.minimum(dist, softmin)
-        return dist
-
-    def _quantitative(self, x, edge_index_seq, edge_weight_seq, normalize=False):
-        phi_val = self.phi._quantitative(x, normalize).squeeze(1)
-        B, N, T = phi_val.shape
-
-        results = []
-        for t in range(T):
-            edge_index = edge_index_seq[t]
-            edge_weights = edge_weight_seq[t]
-            edge_dists = self.distance_fn(edge_weights)
-            soft_dist = self._soft_distance_matrix(edge_index, edge_dists, N)
-
-            mask1 = torch.sigmoid(self.beta * (soft_dist - self.d1))
-            mask2 = torch.sigmoid(self.beta * (soft_dist - self.d2))
-            dist_mask = mask1 * (1 - mask2)
-
-            phi_t = phi_val[:, :, t]
-            dist_mask_batch = dist_mask[None].expand(B, -1, -1)
-            denom = dist_mask.sum(1, keepdim=True).clamp(min=1e-6)
-            masked_score = torch.bmm(dist_mask_batch, phi_t.unsqueeze(-1)).squeeze(-1) / denom
-            results.append(masked_score.unsqueeze(1))
-
-        return torch.cat(results, dim=1).unsqueeze(1)
-
-    def _boolean(self, x, edge_index_seq, edge_weight_seq):
-        phi_val = self.phi._quantitative(x).squeeze(1) > 0.5
-        B, N, T = phi_val.shape
-
-        results = []
-        for t in range(T):
-            edge_index = edge_index_seq[t]
-            edge_weights = edge_weight_seq[t]
-            edge_dists = self.distance_fn(edge_weights)
-
-            dist = torch.full((N, N), float("inf"), device=x.device)
-            dist.fill_diagonal_(0)
-            src, dst = edge_index
-            dist[src, dst] = edge_dists
-
-            for _ in range(self.max_iter):
-                for i in range(N):
-                    dist[i] = torch.minimum(dist[i], (dist[i].unsqueeze(0) + dist).min(dim=0).values)
-
-            dist_mask = (dist >= self.d1) & (dist <= self.d2)
-            phi_t = phi_val[:, :, t]
-            score = torch.bmm(dist_mask[None].float().expand(B, -1, -1), phi_t.unsqueeze(2).float()).squeeze(2) > 0
-            results.append(score.unsqueeze(1))
-
-        return torch.cat(results, dim=1).unsqueeze(1).float()
-
-'''
-from collections import deque # for BFS, controlla che vada bene con la grafo comp. di torch
-# usa pytorch geometric
-from typing import Dict, Set # for visited structure, which tracks which nodes you've already seen at which distances
-
 class Reach(Node):
-    
-    # REACH: checks whether a location satisfying property ϕ₂ can be reached from the current node, through a path 
-    #        of nodes where each node along the way (excluding the destination) satisfies ϕ₁, and the distance of 
-    #        the path lies in the interval [d₁, d₂]
-    
-    # Intuition: From a given location, is there a path through nodes satisfying ϕ₁ that leads to a node satisfying ϕ₂, 
-    #            such that the total distance of the path is within the interval [d₁, d₂]?
-    
-    def __init__(self, phi1: Node, phi2: Node, distance_matrix: Tensor,
-                 d_min: float = 0.0, d_max: float = 1.0,
-                 unbound: bool = False, right_unbound: bool = False):
-        super().__init__()
-        self.phi1 = phi1 # logical expressions to monitor
-        self.phi2 = phi2
-        self.distance_matrix = distance_matrix
-        self.d_min = d_min # Bounds for the distance interval [d₁, d₂] — the allowed range for reachability
-        self.d_max = d_max
-        self.unbound = unbound # disables all distance constraints with infinite range
-        self.right_unbound = right_unbound # models [d₁, ∞]
-
-    def __str__(self):
-        if self.unbound:
-            return f"reach ( {self.phi1} => {self.phi2} )"
-        right = "inf" if self.right_unbound else str(self.d_max)
-        return f"reach_[{self.d_min}, {right}]({self.phi1}, {self.phi2})"
-
-    def time_depth(self):
-        return max(self.phi1.time_depth(), self.phi2.time_depth())
-
-    def _to_B_T_N(self, z: Tensor, N: int) -> Tensor:
-        """Ensure tensor is shaped (B, T, N) regardless of input shape"""
-        # riorganizza i tensori (forma (B, C, T) → (B, T, N))
-        if z.ndim == 3:
-            B, C, T = z.shape
-            if C == 1: # caso in cui c'è la stessa formula per tutti i nodi
-                return z.squeeze(1).unsqueeze(-1).repeat(1, T, N) # (B, T, N)
-            elif C == N: # caso in cui c'è formula diversa per ciascun nodo
-                return z.permute(0, 2, 1) # (B, N, T) → (B, T, N)
-        raise ValueError(f"Unsupported tensor shape for Reach: {z.shape}")
-
-    def _distance_valid(self, dist: float) -> bool:
-        if self.unbound:
-            return True
-        elif self.right_unbound:
-            return dist >= self.d_min
-        else:
-            return self.d_min <= dist <= self.d_max
-
-    def _boolean(self, x: Tensor) -> Tensor:
-        B, N, T = x.shape # B, T, N
-        D = self.distance_matrix
-        
-        # I'm converting the boolean output of phi1 and phi2 to the shape (B, T, N), where
-        # B = batch size, T = time steps, N = number of nodes
-        z1 = self._to_B_T_N(self.phi1._boolean(x), N)
-        z2 = self._to_B_T_N(self.phi2._boolean(x), N)
-        
-        # Initialize an output tensor to False (default: ϕ₁ R ϕ₂ is false until proven otherwise)
-        output = torch.zeros((B, T, N), dtype=torch.bool)
-
-        for b in range(B):
-            for t in range(T):
-                for src in range(N):
-                    visited: Dict[int, Set[float]] = {i: set() for i in range(N)} # Prevent revisiting a node at the same cumulative distance (STREL says the path must not revisit a node at the same cost)
-                    queue = deque([(src, 0.0)]) # Start a breadth-first search (BFS) from node src with distance 0
-
-                    while queue:
-                        node, dist = queue.popleft()
-
-                        # If you reach a different node (node ≠ src) and it satisfies ϕ₂, and the path distance is valid, then ϕ₁ R[d₁,d₂] ϕ₂ is True at src
-                        if node != src and self._distance_valid(dist) and z2[b, t, node]:
-                            output[b, t, src] = True
-                            break
-
-                        for neighbor in range(N):
-                            step = D[node, neighbor].item()
-                            new_dist = dist + step
-                            if step > 0 and (self.unbound or new_dist <= self.d_max):
-                                if neighbor == src or z1[b, t, neighbor]: # This ensures traversal continues only through nodes satisfying ϕ₁
-                                    if new_dist not in visited[neighbor]:
-                                        visited[neighbor].add(new_dist)
-                                        queue.append((neighbor, new_dist))
-
-        return output.unsqueeze(1)
-
-    def _quantitative(self, x: Tensor, normalize=False) -> Tensor:
-        B, N, T = x.shape
-        D = self.distance_matrix
-
-        z1 = self._to_B_T_N(self.phi1._quantitative(x, normalize), N)
-        z2 = self._to_B_T_N(self.phi2._quantitative(x, normalize), N)
-        output = torch.full((B, T, N), float('-inf'))
-
-        for b in range(B):
-            for t in range(T):
-                for src in range(N):
-                    visited: Dict[int, Set[float]] = {i: set() for i in range(N)}
-                    queue = deque([(src, 0.0, float('inf'))]) # In addition to node and distance, you track rob: robustness value (initialized to ∞)
-
-                    while queue:
-                        node, dist, rob = queue.popleft()
-
-                        if node != src and self._distance_valid(dist):
-                            combined = min(rob, z2[b, t, node]) # At each step, update rob
-                            output[b, t, src] = max(output[b, t, src], combined) # Final robustness is the maximum robustness across all valid paths (You apply ⊕ (choose) operator: pick the path with the greatest robustness score. This is Table 1, line 6)
-
-                        for neighbor in range(N):
-                            step = D[node, neighbor].item()
-                            new_dist = dist + step
-                            if step > 0 and (self.unbound or new_dist <= self.d_max):
-                                if neighbor == src or z1[b, t, neighbor] > float('-inf'):
-                                    if new_dist not in visited[neighbor]:
-                                        visited[neighbor].add(new_dist)
-                                        new_rob = min(rob, z1[b, t, neighbor])
-                                        queue.append((neighbor, new_dist, new_rob))
-
-        return output.unsqueeze(1)
-
-
-class Escape(Node):
-    
-    # ESCAPE: checks if it's possible to leave the current region by following a path composed only of nodes 
-    #         satisfying ϕ, and ending at a node at a certain distance away, specifically between [d₁, d₂]
-    
-    # Intuition: From a location, is it possible to escape via a route where all intermediate nodes satisfy ϕ, 
-    #            and the distance between the start and end node is within [d₁, d₂]?
-    
-    def __init__(self, phi: Node, distance_matrix: Tensor,
-                 d_min: float = 0.0, d_max: float = 1.0,
-                 unbound: bool = False, right_unbound: bool = False):
-        super().__init__()
-        self.phi = phi
-        self.distance_matrix = distance_matrix
-        self.d_min = d_min
-        self.d_max = d_max
-        self.unbound = unbound
-        self.right_unbound = right_unbound
-
-    def __str__(self):
-        if self.unbound:
-            return f"escape ( {self.phi} )"
-        right = "inf" if self.right_unbound else str(self.d_max)
-        return f"escape_[{self.d_min}, {right}]({self.phi})"
-
-    def time_depth(self):
-        return self.phi.time_depth()
-
-    def _to_B_T_N(self, z: Tensor, N: int) -> Tensor:
-        if z.ndim == 3:
-            B, C, T = z.shape
-            if C == 1:
-                return z.squeeze(1).unsqueeze(-1).repeat(1, T, N)
-            elif C == N:
-                return z.permute(0, 2, 1)
-        raise ValueError(f"Unsupported tensor shape for Escape: {z.shape}")
-
-    def _distance_valid(self, dist: float) -> bool:
-        if self.unbound:
-            return True
-        elif self.right_unbound:
-            return dist >= self.d_min
-        else:
-            return self.d_min <= dist <= self.d_max
-
-    def _boolean(self, x: Tensor) -> Tensor:
-        B, N, T = x.shape
-        D = self.distance_matrix
-
-        z = self._to_B_T_N(self.phi._boolean(x), N)
-        output = torch.zeros((B, T, N), dtype=torch.bool)
-
-        # Per ogni batch b, tempo t, nodo sorgente src:
-        for b in range(B):
-            for t in range(T):
-                for src in range(N):
-                    
-                    # Per ogni src esamina tutti i nodi dst, se: 
-                    #   - distanza ∈ [d_min, d_max]
-                    #   - dst soddisfa phi
-                    # Allora Escape è True per src (a tempo t)
-                    # In sintesi: può fuggire da qualche parte dove phi è vera?
-                    
-                    for dst in range(N):
-                        dist = D[src, dst].item()
-                        if self._distance_valid(dist) and z[b, t, dst]:
-                            output[b, t, src] = True
-                            break
-
-        return output.unsqueeze(1)
-
-    def _quantitative(self, x: Tensor, normalize=False) -> Tensor:
-        B, N, T = x.shape
-        D = self.distance_matrix
-
-        z = self._to_B_T_N(self.phi._quantitative(x, normalize), N)
-        output = torch.full((B, T, N), float('-inf'))
-
-        for b in range(B):
-            for t in range(T):
-                for src in range(N):
-                    for dst in range(N):
-                        dist = D[src, dst].item()
-                        if self._distance_valid(dist):
-                            output[b, t, src] = max(output[b, t, src], z[b, t, dst]) # Similar to reach, but doesn’t accumulate robustness along a path
-                            #Just checks the robustness value of the destination node, assuming ϕ must hold at that destination
-
-        return output.unsqueeze(1)
-'''  
-
-'''
-from torch import nn
-from typing import Callable, Optional
-
-class Reach(Node):
-# The Reach class checks whether a node can reach another node that 
-# satisfies a certain property (phi2) through a path of nodes satisfying 
-# another property (phi1), within a specified distance interval [d1, d2]
+    """
+    Reachability operator for STREL. Models bounded or unbounded reach
+    over a spatial graph.
+    """
     def __init__(
         self,
-        phi1: Node,
-        phi2: Node,
-        distance_fn: Callable[[Tensor], Tensor], # distance_fn is expected to be: a function that takes one argument of type Tensor and returns a value of type Tensor
-        edge_index: Tensor,
-        edge_weights: Tensor,
-        d1: float,
-        d2: Optional[float] = None,
-        num_nodes: Optional[int] = None,
-        beta: float = 10.0,
-        max_iter: int = 10,
-    ):
+        left_child: Node,
+        right_child: Node,
+        distance_matrix: Tensor,
+        d1: realnum,
+        d2: realnum,
+        graph_nodes: Tensor,
+        is_unbounded: bool = False,
+        distance_domain_min: realnum = None,
+        distance_domain_max: realnum = None,
+    ) -> None:
         super().__init__()
-        self.phi1 = phi1
-        self.phi2 = phi2
-        self.distance_fn = distance_fn # maps weights to distances
-        self.edge_index = edge_index # defines the graph: a 2×E (standard format in PyTorch Geometric, E is the number of edges) tensor of source/target indices
-        self.edge_weights = edge_weights # edge-wise distances (1D tensor of size E) used in bounding the reach (line 5 in alg 4)
-        self.edge_dists = self.distance_fn(edge_weights)  # cache distances, used for computing things like: shortest paths (softmin), distance masks (for [d₁, d₂] bounds), soft adjacency matrices
+        self.left_child = left_child
+        self.right_child = right_child
         self.d1 = d1
-        self.d2 = float('inf') if d2 is None else d2 # If d2 is infinite, the operator corresponds to the unbounded case in Algorithm 4
-        self.num_nodes = num_nodes or int(edge_index.max().item()) + 1 # num_nodes is inferred if not provided
-        self.beta = beta # controls the softness of approximations (sigmoid, softmin)
-        self.max_iter = max_iter # limits iterations of propagation — replaces while loop in Algorithm 4
+        self.d2 = d2
+        self.is_unbounded = is_unbounded
+        self.distance_domain_min = distance_domain_min
+        self.distance_domain_max = distance_domain_max
+        self.graph_nodes = graph_nodes
+
+        self.weight_matrix = distance_matrix
+        self.adjacency_matrix = (distance_matrix > 0).int()
+
+        self.boolean_min_satisfaction = torch.tensor(0.0)
+        self.quantitative_min_satisfaction = torch.tensor(float('-inf'))
 
     def __str__(self) -> str:
-        return f"Reach({self.phi1}, {self.phi2}, d1={self.d1}, d2={self.d2})"
+        bound_type = "unbounded" if self.is_unbounded else f"[{self.d1},{self.d2}]"
+        return f"Reach{bound_type}"
 
-    def time_depth(self) -> int:
-        return max(self.phi1.time_depth(), self.phi2.time_depth())
+    def neighbors_fn(self, node):
+        mask = self.adjacency_matrix[:, node] > 0
+        neighbors = self.graph_nodes[mask]
+        neigh_pairs = [(i.item(), self.weight_matrix[i, node].item()) for i in neighbors]
+        # print('node = ', node, ' has neigh_pairs = ', neigh_pairs)
+        return neigh_pairs
 
-    def _build_soft_adjacency(self, phi1_val: Tensor) -> Tensor:
-        # Builds a differentiable adjacency matrix that only allows propagation 
-        # through φ₁-satisfying nodes (lines 7–10 of Algorithm 3)
-        src, dst = self.edge_index # nodi di partenza e di destinazione nella matrice edge_index
-        A = torch.zeros(self.num_nodes, self.num_nodes, device=phi1_val.device) # A contains softened weights on valid edges, where smaller distance ⇒ higher weight
-        A[src, dst] = torch.exp(-self.beta * self.edge_dists).clamp(min=1e-6) # clamp(min=1e-6) evita zeri che potrebbero causare problemi numerici
-        # A è la matrice di adiacenza pesata: dimensione [N, N], inizialmente tutta a 0.
-        # Per ogni arco (i, j), assegna un valore decrescente in base alla distanza: a[i, j]=exp(-beta * distance)
-        # più corta la distanza, più grande il peso (cioè più facilmente attraversabile)
-        
-        # Uses φ₁ to gate the edges (both src and dst must satisfy φ₁): 
-        # mimics the if z1[...] condition in Algorithm 3, line 10
-        phi1_gate = torch.sigmoid(self.beta * phi1_val) # Applica la sigmoide a ogni valore: se φ₁ è “attivata” in un nodo (positiva), il valore sarà vicino a 1, β rende la sigmoide più netta (con β → ∞, tende a 0/1 hard gating)
-        gate_mask = phi1_gate.unsqueeze(1) * phi1_gate.unsqueeze(2) # Simula: "permetti attraversamento da i a j solo se sia i che j soddisfano φ₁"
-        # dimensione gate_mask è [B, N, N] perchè: phi1_gate diventa [B, 1, N] e [B, N, 1], e il loro prodotto fa una matrice [B, N, N]
-        # phi1_val ha dimensione [B, N, T] o [B, N] (a seconda che ci sia tempo fissato)
-        
-        return A.unsqueeze(0) * gate_mask 
-        # A ha shape [N, N], quindi unsqueeze(0) → [1, N, N]
-        # gate_mask ha shape [B, N, N]
-        # Output: [B, N, N] matrice di adiacenza soft per ogni batch
+    def distance_function(self, weight):
+        return weight
 
-        # La funzione ritorna una matrice di adiacenza soft (differenziabile) che rappresenta il grafo, ma:
-        # - i pesi sono “soft” (esponenziali decrescenti con la distanza),
-        # - le connessioni sono attivate solo se entrambi i nodi coinvolti soddisfano φ₁
-        
-    def _soft_distance_matrix(self) -> Tensor: # calcola una matrice delle distanze minime tra tutti i nodi del grafo, in modo differenziabile
-        
-        # Implements distance propagation using softmin, analogous to 
-        # Dijkstra or Floyd-Warshall. This is the differentiable 
-        # equivalent of computing d′ = d +_B f(w) in Algorithm 3, line 9.
-        N = self.num_nodes # numero di nodi nel grafo
-        device = self.edge_weights.device # assicura che tutto venga eseguito su CPU o GPU coerentemente
-        
-        # Initialize the shortest-path distance matrix.
-        dist = torch.full((N, N), float("inf"), device=device) # Crea una matrice N x N piena di ∞ (infinito): ogni nodo è inizialmente irraggiungibile da ogni altro
-        dist.fill_diagonal_(0) # Imposta 0 sulla diagonale: la distanza da un nodo a sé stesso è 0
-        src, dst = self.edge_index # self.edge_index = coppie (sorgente, destinazione) degli archi
-        dist[src, dst] = self.edge_dists # self.edge_dists = distanza (già calcolata da distance_fn) su ogni arco
-        # Imposta le distanze note nei corrispondenti elementi della matrice
-
-        #Uses log-sum-exp softmin over paths: approximates min-distance for all pairs.
-        for _ in range(self.max_iter): # stiamo costruendo tutte le combinazioni di cammini a due passi
-        # Il ciclo for _ in range(self.max_iter) simula un algoritmo di tipo Floyd–Warshall, ma solo per 
-        # un numero finito di iterazioni (per motivi computazionali). Ogni iterazione permette la propagazione 
-        # della distanza su percorsi sempre più lunghi    
-        
-            current = dist.unsqueeze(0) + dist.unsqueeze(1)
-            # dist.unsqueeze(0) → shape [1, N, N] (prima matrice)
-            # dist.unsqueeze(1) → shape [N, 1, N] (seconda matrice)
-            # sommandoli otteniamo current[i, j, k] = dist[i, j] + dist[j, k]
-            # → rappresenta il costo del cammino i → j → k
-            
-            softmin = -torch.logsumexp(-self.beta * current, dim=2) / self.beta
-            # Applica una softmin sull’ultima dimensione (tutti i j intermedi):
-                # logsumexp è un modo differenziabile di approssimare il minimo.
-                # Più β è grande, più il risultato si avvicina al vero minimo.
-                # Restituisce la distanza più breve (soft) da i → k passando per un nodo intermedio
-            
-            dist = torch.minimum(dist, softmin) # Aggiorna dist[i, k] solo se il nuovo percorso trovato tramite softmin è più corto
-            
-        return dist # Restituisce una matrice dist[i, j] che rappresenta la distanza più breve (approssimata) tra ogni coppia di nodi i → j, usando un'operazione softmin che può essere derivata
-
-    def _quantitative(self, x: Tensor, normalize: bool = False) -> Tensor:
-        # Evaluates robustness of φ₁ and φ₂ at each node and time step
-        
-        # for each node and time step, propagates satisfaction of phi2 
-        # through phi1-valid paths and accumulates over paths whose 
-        # distances lie within [d1, d2]
-        
-        # Per ogni nodo e istante temporale:
-            # Valuta φ₂ nei nodi destinazione.
-            # Propaga il valore di φ₂ solo lungo nodi che soddisfano φ₁.
-            # Tiene conto solo dei cammini la cui lunghezza soft è compresa tra d₁ e d₂.
-            # Restituisce quanto fortemente ogni nodo soddisfa l'operatore φ₁ R[d₁,d₂] φ₂
-        
-        # Calcola la robustezza quantitativa delle formule φ₁ e φ₂ per ogni nodo e istante temporale
-        phi1_val = self.phi1._quantitative(x, normalize).squeeze(1)
-        phi2_val = self.phi2._quantitative(x, normalize).squeeze(1)
-        B, N, T = phi1_val.shape 
-        # Output: tensori di forma [B, N, T] dove: 
-        # B = batch size (numero di esempi), 
-        # N = numero di nodi,
-        # T = numero di istanti temporali (time steps)
-
-        # Builds a soft mask for the interval [d₁, d₂]. This replaces the 
-        # if d1 ≤ d ≤ d2 condition in Algorithm 3, line 10.
-        soft_dist = self._soft_distance_matrix() # soft_dist[i, j]: distanza soft da nodo i a j
-        mask1 = torch.sigmoid(self.beta * (soft_dist - self.d1)) # mask1 attiva i valori dove dist ≥ d1
-        mask2 = torch.sigmoid(self.beta * (soft_dist - self.d2)) # mask2 attiva i valori dove dist ≥ d2
-        dist_mask = mask1 * (1 - mask2) # La differenza mask1 * (1 - mask2) approssima 1 se d ∈ [d1, d2], altrimenti 0
-        # dist_mask ha forma [N, N]
-        
-        results = []
-        # Iterative propagation of robustness values from φ₂ nodes over 
-        # the φ₁-gated graph — matches the BFS-style loop of Algorithm 4, lines 9–21
-        for t in range(T):
-            phi1_t = phi1_val[:, :, t] # Estrai le valutazioni di φ₁ e φ₂ al tempo t
-            phi2_t = phi2_val[:, :, t]
-            soft_adj = self._build_soft_adjacency(phi1_t) # Rende disponibili solo i cammini dove entrambi i nodi soddisfano φ₁
-            # soft_adj ha forma [B, N, N]
-            
-            score = phi2_t.clone()
-            for _ in range(self.max_iter): # Propaga la robustezza φ₂ attraverso i cammini φ₁-validi
-                score = torch.maximum(score, torch.bmm(soft_adj, score.unsqueeze(-1)).squeeze(-1)) # score raccoglie il massimo valore raggiungibile da ogni nodo
-
-            dist_mask_batch = dist_mask[None].expand(B, -1, -1) # Applica dist_mask come filtro ai valori di score, cioè solo i nodi raggiungibili entro [d₁, d₂] contribuiscono
-            denom = dist_mask.sum(1, keepdim=True).clamp(min=1e-6) # Fa una media pesata, normalizzando per evitare divisioni per zero (clamp)
-            masked_score = torch.bmm(dist_mask_batch, score.unsqueeze(-1)).squeeze(-1) / denom
-            # masked score: Aggregates scores over valid destinations. Implements 
-            # the ⊕ accumulation of all (ℓ, ℓ′) with d ∈ [d₁, d₂] as in Algorithm 3, lines 22–24
-            results.append(masked_score.unsqueeze(1)) # Salva il risultato per il tempo t
-
-        return torch.cat(results, dim=1).unsqueeze(1) # Concatena i risultati lungo l’asse temporale → forma finale: [B, 1, T]
+    # ----------------
+    #    Boolean
+    # ----------------
 
     def _boolean(self, x: Tensor) -> Tensor:
-        # evaluates the same reachability condition with strict true/false logic
-        
-        # Per ogni nodo e istante temporale t, verifica se esiste un nodo che:
-            # Soddisfa φ₂.
-            # È raggiungibile attraverso nodi che soddisfano φ₁.
-            # Si trova a distanza compresa tra d₁ e d₂
+        s1 = self.left_child._boolean(x).squeeze()
+        s2 = self.right_child._boolean(x).squeeze()
 
-        phi1_val = self.phi1._quantitative(x).squeeze(1) > 0.5 # Se la robustezza > 0.5, allora si considera vera, altrimenti falsa
-        phi2_val = self.phi2._quantitative(x).squeeze(1) > 0.5
-        B, N, T = phi1_val.shape # phi1_val, phi2_val → shape [B, N, T]
+        if self.is_unbounded:
+            return self._unbounded_reach_boolean(s1, s2)
+        else:
+            return self._bounded_reach_boolean(s1, s2)
 
-        # Costruisce la matrice di adiacenza del grafo adj[i, j] = True se esiste arco i → j
-        src, dst = self.edge_index
-        adj = torch.zeros(N, N, dtype=torch.bool, device=x.device)
-        adj[src, dst] = True
+    def _bounded_reach_boolean(self, s1, s2):
+        s = torch.zeros(len(self.graph_nodes), dtype=torch.float32, requires_grad=True)
 
-        # Distanze Minime (tipo Floyd-Warshall): calcola le distanze minime tra i nodi
-        dist = torch.full((N, N), float("inf"), device=x.device) # Inizializza matrice delle distanze
-        dist.fill_diagonal_(0) # Imposta a 0 la diagonale (distanza da sé stessi)
-        dist[src, dst] = self.edge_dists # Inserisce le distanze reali sugli archi
+        for i, lt in enumerate(self.graph_nodes):
+            l = lt.item()
+            if self.d1 == self.distance_domain_min:
+                s = s.clone().scatter_(0, torch.tensor([l]), s2[l].to(dtype=s.dtype))
+            else:
+                s = s.clone().scatter_(0, torch.tensor([l]), self.boolean_min_satisfaction.to(dtype=s.dtype))
 
-        # Calcolo delle distanze minime tra tutti i nodi: Approssima l'algoritmo di Floyd–Warshall per trovare distanze minime tra tutti i nodi
-        for _ in range(self.max_iter):
-            for i in range(N):
-                combined = dist[i].unsqueeze(0) + dist
-                dist[i] = torch.minimum(dist[i], combined.min(dim=0).values) # dist[i, j]: distanza più breve da nodo i a nodo j
+        Q = {llt.item(): [(s2[llt.item()].to(dtype=s.dtype), self.distance_domain_min)] for llt in self.graph_nodes}
 
-        dist_mask = (dist >= self.d1) & (dist <= self.d2) # dist_mask[i, j] = True se la distanza tra i e j è dentro l’intervallo
+        while Q:
+            Q_prime = {}
+            for l in Q.keys():
+                for v, d in Q[l]:
+                    for l_prime, w in self.neighbors_fn(l):
+                        v_new = torch.minimum(v, s1[l_prime].to(dtype=s.dtype))
+                        d_new = d + w
 
-        results = []
-        for t in range(T): # per ogni istante di tempo estrae una valutazione delle fo0rmule
-            phi1_t = phi1_val[:, :, t]
-            phi2_t = phi2_val[:, :, t]
+                        if self.d1 <= d_new <= self.d2:
+                            current_val = s[l_prime]
+                            new_val = torch.maximum(current_val, v_new)
+                            s = s.clone().scatter_(0, torch.tensor([l_prime]), new_val.to(dtype=s.dtype))
 
-            # Emulates line 15 in Algorithm 3, where previous values are 
-            # combined using ⊕ (boolean OR)
-            score = phi2_t.clone() # Inizialmente score[i] = True se il nodo i soddisfa φ₂
-            for _ in range(self.max_iter):
-                phi1_mask = phi1_t.unsqueeze(2) & phi1_t.unsqueeze(1) # Costruisce phi1_mask per permettere solo la propagazione tra nodi che soddisfano φ₁
-                batch_adj = adj.unsqueeze(0).expand(B, -1, -1) & phi1_mask
-                propagated = torch.bmm(batch_adj.float(), score.unsqueeze(2).float()).squeeze(2) > 0 # Applica la propagazione: un nodo eredita True se almeno uno dei suoi vicini φ₁-validi ha True
-                score = score | propagated
+                        if d_new < self.d2:
 
-            # Final result checks if there's any reachable φ₂ node in the valid distance interval
-            final = torch.bmm(dist_mask[None].float().expand(B, -1, -1), score.unsqueeze(2).float()).squeeze(2) > 0
-            # Final moltiplica dist_mask per score: seleziona solo i nodi che:
-                # soddisfano φ₂
-                # sono raggiungibili entro distanza valida.
-            # Se almeno un nodo soddisfa entrambe le condizioni, allora final = True.
-            
-            results.append(final.unsqueeze(1)) # salva il risultato
+                            existing_entries = Q_prime.get(l_prime, [])
+                            updated = False
+                            new_entries = []
+                            for vv, dd in existing_entries:
+                                if dd == d_new:
+                                    new_v = torch.maximum(vv, v_new)
+                                    new_entries.append((new_v, dd))
+                                    updated = True
+                                else:
+                                    new_entries.append((vv, dd))
 
-        return torch.cat(results, dim=1).unsqueeze(1).float() # Restituisce un tensore di shape [B, 1, T], con 1.0 se il nodo soddisfa la formula φ₁ R[d₁,d₂] φ₂, 0.0 altrimenti
+                            if not updated:
+                                new_entries.append((v_new, d_new))
+                            Q_prime[l_prime] = new_entries
 
+            Q = Q_prime
+        return s.unsqueeze(0).unsqueeze(-1)
+
+    def _unbounded_reach_boolean(self, s1, s2):
+
+        if self.d1 == self.distance_domain_min:
+            s = s2.to(dtype=torch.float32)
+        else:
+            d_max = torch.max(self.distance_function(self.weight_matrix))
+            self.d2 = self.d1 + d_max
+            s = self._bounded_reach_boolean(s1, s2).squeeze()
+
+        T = [n for n in self.graph_nodes]
+
+        while T:
+            T_prime = []
+
+            for l in T:
+                for l_prime, w in self.neighbors_fn(l):
+                    v_prime = torch.minimum(s[l], s1[l_prime].to(dtype=s.dtype))
+                    v_prime = torch.maximum(v_prime, s[l_prime])
+
+                    if v_prime != s[l_prime]:
+                        s = s.clone().scatter_(0, torch.tensor([l_prime]), v_prime.to(dtype=s.dtype))
+                        T_prime.append(l_prime)
+
+            T = T_prime
+
+        return s.unsqueeze(0).unsqueeze(-1)
+
+    # ---------------------
+    #     Quantitative
+    # ---------------------
+
+    def _quantitative(self, x: Tensor, normalize: bool = False) -> Tensor:
+        s1 = self.left_child._quantitative(x, normalize).squeeze()
+        s2 = self.right_child._quantitative(x, normalize).squeeze()
+
+        if self.is_unbounded:
+            return self._unbounded_reach_quantitative(s1, s2)
+        else:
+            return self._bounded_reach_quantitative(s1, s2)
+
+    def _bounded_reach_quantitative(self, s1, s2):
+        s = torch.full((len(self.graph_nodes),), self.quantitative_min_satisfaction, dtype=torch.float32, requires_grad=True)
+
+        for i, lt in enumerate(self.graph_nodes):
+            l = lt.item()
+            if self.d1 == self.distance_domain_min:
+                s = s.clone().scatter_(0, torch.tensor([l]), s2[l].to(dtype=s.dtype))
+            else:
+                s = s.clone().scatter_(0, torch.tensor([l]), self.quantitative_min_satisfaction.to(dtype=s.dtype))
+
+        Q = {llt.item(): [(s2[llt.item()].to(dtype=s.dtype), self.distance_domain_min)] for llt in self.graph_nodes}
+
+        while Q:
+            Q_prime = {}
+            for l in Q.keys():
+                for (v, d) in Q[l]:
+                    for l_prime, w in self.neighbors_fn(l):
+                        v_new = torch.minimum(v, s1[l_prime].to(dtype=s.dtype))
+                        d_new = d + w
+
+                        if self.d1 <= d_new <= self.d2:
+                            current_val = s[l_prime]
+                            new_val = torch.maximum(current_val, v_new)
+                            s = s.clone().scatter_(0, torch.tensor([l_prime]), new_val.to(dtype=s.dtype))
+
+                        if d_new < self.d2:
+                            existing_entries = Q_prime.get(l_prime, [])
+                            updated = False
+                            new_entries = []
+                            for (vv, dd) in existing_entries:
+                                if dd == d_new:
+                                    new_v = torch.maximum(vv, v_new)
+                                    new_entries.append((new_v, dd))
+                                    updated = True
+                                else:
+                                    new_entries.append((vv, dd))
+                            if not updated:
+                                new_entries.append((v_new, d_new))
+                            Q_prime[l_prime] = new_entries
+            Q = Q_prime
+
+        return s.unsqueeze(0).unsqueeze(-1)
+
+    def _unbounded_reach_quantitative(self, s1, s2):
+
+        if self.d1 == self.distance_domain_min:
+            s = s2.to(dtype=torch.float32)
+        else:
+            d_max = torch.max(self.distance_function(self.weight_matrix))
+            self.d2 = self.d1 + d_max
+            s = self._bounded_reach_quantitative(s1, s2).squeeze()
+
+        T = [n for n in self.graph_nodes]
+
+        while T:
+            T_prime = []
+
+            for l in T:
+                for l_prime, w in self.neighbors_fn(l):
+                    v_prime = torch.minimum(s[l], s1[l_prime].to(dtype=s.dtype))
+                    new_val = torch.maximum(v_prime, s[l_prime])
+                    if new_val != s[l_prime]:
+                        s = s.clone().scatter_(0, torch.tensor([l_prime]), new_val.to(dtype=s.dtype))
+                        T_prime.append(l_prime)
+            T = T_prime
+
+        return s.unsqueeze(0).unsqueeze(-1)
 
 class Escape(Node):
+    """
+    Escape operator for STREL. Models escape condition over a spatial graph.
+    """
     def __init__(
         self,
-        phi: Node,
-        distance_fn: Callable[[Tensor], Tensor],
-        edge_index: Tensor,
-        edge_weights: Tensor,
-        d1: float,
-        d2: Optional[float] = None,
-        num_nodes: Optional[int] = None,
-        beta: float = 10.0,
-        max_iter: int = 10,
-    ):
+        child: Node,
+        distance_matrix: Tensor,
+        d1: realnum,
+        d2: realnum,
+        graph_nodes: Tensor,
+        distance_domain_min: realnum = None,
+        distance_domain_max: realnum = None,
+    ) -> None:
         super().__init__()
-        self.phi = phi
-        self.distance_fn = distance_fn
-        self.edge_index = edge_index
-        self.edge_weights = edge_weights
-        self.edge_dists = self.distance_fn(edge_weights)
+        self.child = child
         self.d1 = d1
-        self.d2 = float('inf') if d2 is None else d2
-        self.num_nodes = num_nodes or int(edge_index.max().item()) + 1
-        self.beta = beta
-        self.max_iter = max_iter
+        self.d2 = d2
+        self.distance_domain_min = distance_domain_min
+        self.distance_domain_max = distance_domain_max
+        self.graph_nodes = graph_nodes
 
-    def __str__(self) -> str:
-        return f"Escape({self.phi}, d1={self.d1}, d2={self.d2})"
+        self.weight_matrix = distance_matrix
+        self.adjacency_matrix = (distance_matrix > 0).int()
 
-    def time_depth(self) -> int:
-        return self.phi.time_depth()
+        self.boolean_min_satisfaction = torch.tensor(0.0)
+        self.quantitative_min_satisfaction = torch.tensor(float('-inf'))
 
-    def _soft_distance_matrix(self) -> Tensor:
-        N = self.num_nodes
-        device = self.edge_weights.device
-        dist = torch.full((N, N), float("inf"), device=device)
-        dist.fill_diagonal_(0)
-        src, dst = self.edge_index
-        dist[src, dst] = self.edge_dists
+    def neighbors_fn(self, node):
+        mask = (self.adjacency_matrix[:, node] > 0)
+        neighbors = self.graph_nodes[mask]
+        return [(i.item(), self.weight_matrix[i, node].item()) for i in neighbors]
 
-        for _ in range(self.max_iter):
-            current = dist.unsqueeze(0) + dist.unsqueeze(1)
-            softmin = -torch.logsumexp(-self.beta * current, dim=2) / self.beta
-            dist = torch.minimum(dist, softmin)
-        return dist
+    def forward_neighbors_fn(self, node):
+        mask = (self.adjacency_matrix[node, :] > 0)
+        neighbors = self.graph_nodes[mask]
+        return [(j.item(), self.weight_matrix[node, j].item()) for j in neighbors]
 
-    def _quantitative(self, x: Tensor, normalize: bool = False) -> Tensor:
-        phi_val = self.phi._quantitative(x, normalize).squeeze(1)
-        B, N, T = phi_val.shape
+    def compute_min_distance_matrix(self):
 
-        # Computes soft mask as in lines 23–24 of Algorithm 5: 
-        # aggregates φ values at destinations with valid distance
-        soft_dist = self._soft_distance_matrix()
-        mask1 = torch.sigmoid(self.beta * (soft_dist - self.d1))
-        mask2 = torch.sigmoid(self.beta * (soft_dist - self.d2))
-        dist_mask = mask1 * (1 - mask2)
+        n = len(self.graph_nodes) # Numero di nodi nel grafo
+        D = torch.full((n, n), float('inf')) # matrice n x n inizializzata con infinito (inf). Alla fine conterrà le distanze minime tra ogni coppia di nodi.
 
-        results = []
-        # Aggregates destination φ values over valid [d₁, d₂] 
-        # (as in s(ℓ) = ⊕ e[ℓ, ℓ′])
-        for t in range(T):
-            phi_t = phi_val[:, :, t]
-            dist_mask_batch = dist_mask[None].expand(B, -1, -1)
-            denom = dist_mask.sum(1, keepdim=True).clamp(min=1e-6)
-            masked_score = torch.bmm(dist_mask_batch, phi_t.unsqueeze(-1)).squeeze(-1) / denom
-            results.append(masked_score.unsqueeze(1))
+        for start in range(n): # Calcola le distanze dal nodo start a tutti gli altri
+            visited = torch.zeros(n, dtype=torch.bool) # tiene traccia dei nodi già visitati
+            distance = torch.full((n,), float('inf')) # array delle distanze minime dal nodo start
+            distance[start] = 0 # Inizia da 'start'
 
-        return torch.cat(results, dim=1).unsqueeze(1)
+            frontier = torch.zeros(n, dtype=torch.bool) # Nodi da visitare nel livello corrente
+            frontier[start] = True # Inizia da 'start'
+
+            while frontier.any(): # itera finché ci sono nodi nella frontiera
+                next_frontier = torch.zeros(n, dtype=torch.bool) # Prepara la frontier per il livello successivo
+
+                for node in torch.nonzero(frontier).flatten(): # Per ogni nodo nella frontiera attuale, lo segna come visitato
+                    node = node.item()
+                    visited[node] = True
+
+                    for neighbor, weight in self.forward_neighbors_fn(node): # Recupera i vicini del nodo e il peso del collegamento
+                        if visited[neighbor]:
+                            continue
+                        # edge_cost = weight if getattr(self, "use_weights", False) else 1.0 # Se use_weights=True, usa il peso reale dell’arco. Altrimenti, ogni arco conta 1 (hop count booleano)
+                        edge_cost = weight # if self.use_weights else 1.0
+                        new_dist = distance[node] + edge_cost # Calcola la distanza cumulativa provvisoria al vicino
+
+                        # Se è una distanza più breve di quella attuale, la aggiorna e aggiunge il vicino alla prossima frontiera
+                        if new_dist < distance[neighbor]:
+                            distance[neighbor] = new_dist
+                            next_frontier[neighbor] = True
+
+                frontier = next_frontier # Passa alla prossima frontiera da esplorare
+
+            D[start] = distance # Dopo aver esplorato tutti i percorsi dal nodo start, salva le distanze finali
+
+        return D # Restituisce la matrice completa D con le distanze minime tra tutti i nodi, pesate o in hop
+
+    # ----------------
+    #    Boolean
+    # ----------------
 
     def _boolean(self, x: Tensor) -> Tensor:
-        # Checks if any reachable node at distance ∈ [d₁, d₂] satisfies φ — as per line 12 of Algorithm 5
-        phi_val = self.phi._quantitative(x).squeeze(1) > 0.5
-        B, N, T = phi_val.shape
 
-        src, dst = self.edge_index
-        adj = torch.zeros(N, N, dtype=torch.bool, device=x.device)
-        adj[src, dst] = True
+        s1 = self.child._boolean(x).squeeze()
 
-        dist = torch.full((N, N), float("inf"), device=x.device)
-        dist.fill_diagonal_(0)
-        dist[src, dst] = self.edge_dists
+        L = self.graph_nodes
+        n = len(L)
 
-        for _ in range(self.max_iter):
-            for i in range(N):
-                combined = dist[i].unsqueeze(0) + dist
-                dist[i] = torch.minimum(dist[i], combined.min(dim=0).values)
+        D = self.compute_min_distance_matrix()
 
-        dist_mask = (dist >= self.d1) & (dist <= self.d2)
+        e = torch.ones((n, n), requires_grad=True) * self.boolean_min_satisfaction
+        e = e - torch.diag(torch.diag(e)) + torch.diag(s1)
 
-        results = []
-        for t in range(T):
-            phi_t = phi_val[:, :, t]
-            score = torch.bmm(dist_mask[None].float().expand(B, -1, -1), phi_t.unsqueeze(2).float()).squeeze(2) > 0
-            results.append(score.unsqueeze(1))
+        T = [(i, i) for i in range(n)]
 
-        return torch.cat(results, dim=1).unsqueeze(1).float()
-'''
+        while T:
+            T_prime = []
+            e_prime = e.clone()
+
+            for l1, l2 in T:
+                for l1_prime, w in self.neighbors_fn(l1):
+                    new_val = torch.minimum(s1[l1_prime], e[l1, l2])
+                    old_val = e[l1_prime, l2]
+                    combined = torch.maximum(old_val, new_val)
+
+                    if combined != old_val:
+                        e_prime = e_prime.clone().index_put_(tuple(torch.tensor([[l1_prime], [l2]])), combined)
+                        T_prime.append((l1_prime, l2))
+
+            T = T_prime
+            e = e_prime
+
+        s = torch.ones(n, requires_grad=True) * self.boolean_min_satisfaction
+        for i in range(n):
+            vals = [e[i, j] for j in range(n) if self.d1 <= D[i, j] <= self.d2]
+            if vals:
+                max_val = torch.stack(vals).max()
+                s = s.clone().scatter_(0, torch.tensor([i]), max_val.unsqueeze(0))
+
+        return s.unsqueeze(0).unsqueeze(-1)
+
+    # ---------------------
+    #     Quantitative
+    # ---------------------
+
+    def _quantitative(self, x: Tensor, normalize: bool = False) -> Tensor:
+      
+        s1 = self.child._quantitative(x, normalize).squeeze()
+
+        L = self.graph_nodes
+        n = len(L)
+
+        D = self.compute_min_distance_matrix()
+
+        e = torch.ones((n, n), requires_grad=True) * self.quantitative_min_satisfaction
+        e = e - torch.diag(torch.diag(e)) + torch.diag(s1)
+
+        T = [(i, i) for i in range(n)]
+
+        while T:
+            T_prime = []
+            e_prime = e.clone()
+
+            for l1, l2 in T:
+                for l1_prime, w in self.neighbors_fn(l1):
+                    new_val = torch.minimum(s1[l1_prime], e[l1, l2])
+                    old_val = e[l1_prime, l2]
+                    combined = torch.maximum(old_val, new_val)
+
+                    if combined != old_val:
+                        e_prime = e_prime.clone().index_put_(
+                            tuple(torch.tensor([[l1_prime], [l2]])), combined
+                        )
+                        T_prime.append((l1_prime, l2))
+
+            T = T_prime
+            e = e_prime
+
+        s = torch.ones(n, requires_grad=True) * self.quantitative_min_satisfaction
+        for i in range(n):
+            vals = [
+                e[i, j] for j in range(n)
+                if self.d1 <= D[i, j] <= self.d2
+            ]
+            if vals:
+                max_val = torch.stack(vals).max()
+                s = s.clone().scatter_(0, torch.tensor([i]), max_val.unsqueeze(0))
+
+        return s.unsqueeze(0).unsqueeze(-1)
+
+class Somewhere(Node):
+    """
+    Somewhere operator for STREL. Models existence of a satisfying location within a distance interval.
+    """
+    def __init__(
+        self,
+        child: Node,
+        distance_matrix: Tensor,
+        d2: realnum,
+        graph_nodes: Tensor,
+        distance_domain_min: realnum = None,
+        distance_domain_max: realnum = None,
+    ) -> None:
+        super().__init__()
+        self.child = child
+        self.d1 = 0
+        self.d2 = d2
+        self.distance_domain_min = distance_domain_min
+        self.distance_domain_max = distance_domain_max
+        self.graph_nodes = graph_nodes
+
+        # Create a true node (always true)
+        self.true_node = Atom(0, float('inf'), lte=True)  # x_0 <= inf (always true)
+        
+        # Create Reach operator
+        self.reach_op = Reach(
+            left_child=self.true_node,
+            right_child=child,
+            distance_matrix=distance_matrix,
+            d1=self.d1,
+            d2=d2,
+            graph_nodes=graph_nodes,
+            distance_domain_min=distance_domain_min,
+            distance_domain_max=distance_domain_max
+        )
+
+    def __str__(self) -> str:
+        return f"somewhere_[{self.d1},{self.d2}] ( {self.child} )"
+
+    def _boolean(self, x: Tensor) -> Tensor:
+        return self.reach_op._boolean(x)
+
+    def _quantitative(self, x: Tensor, normalize: bool = False) -> Tensor:
+        return self.reach_op._quantitative(x, normalize)
+
+class Everywhere(Node):
+    """
+    Everywhere operator for STREL. Models satisfaction of a property at all locations within a distance interval.
+    """
+    def __init__(
+        self,
+        child: Node,
+        distance_matrix: Tensor,
+        d2: realnum,
+        graph_nodes: Tensor,
+        distance_domain_min: realnum = None,
+        distance_domain_max: realnum = None,
+    ) -> None:
+        super().__init__()
+        self.child = child
+        self.d1 = 0
+        self.d2 = d2
+        self.distance_domain_min = distance_domain_min
+        self.distance_domain_max = distance_domain_max
+        self.graph_nodes = graph_nodes
+
+        # Create a true node (always true)
+        self.true_node = Atom(0, float('inf'), lte=True)  # x_0 <= inf (always true)
+        
+        # Create Reach operator
+        self.reach_op = Reach(
+            left_child=self.true_node,
+            right_child=Not(self.child), # child,
+            distance_matrix=distance_matrix,
+            d1=self.d1,
+            d2=d2,
+            graph_nodes=graph_nodes,
+            distance_domain_min=distance_domain_min,
+            distance_domain_max=distance_domain_max
+        )
+
+    def __str__(self) -> str:
+        return f"somewhere_[{self.d1},{self.d2}] ( {self.child} )"
+
+    def _boolean(self, x: Tensor) -> Tensor:
+        return 1.0 - self.reach_op._boolean(x)
+
+    def _quantitative(self, x: Tensor, normalize: bool = False) -> Tensor:
+        return - self.reach_op._quantitative(x, normalize)
+    
+class Surround(Node):
+    """
+    Surround operator for STREL. Models being surrounded by φ2 while in φ1 with distance constraints.
+    """
+    def __init__(
+        self,
+        left_child: Node,
+        right_child: Node,
+        distance_matrix: Tensor,
+        d2: realnum,
+        graph_nodes: Tensor,
+        distance_domain_min: realnum = None,
+        distance_domain_max: realnum = None,
+    ) -> None:
+        super().__init__()
+        self.left_child = left_child
+        self.right_child = right_child
+        self.d1 = 0
+        self.d2 = d2
+        self.distance_domain_min = distance_domain_min
+        self.distance_domain_max = distance_domain_max
+        self.graph_nodes = graph_nodes
+        
+        # Create Reach operator
+        self.reach_op = Reach(
+            left_child=left_child,
+            right_child=Not(Or(left_child, right_child)), 
+            distance_matrix=distance_matrix,
+            d1=self.d1,
+            d2=d2,
+            graph_nodes=graph_nodes,
+            distance_domain_min=distance_domain_min,
+            distance_domain_max=distance_domain_max
+        )
+        
+        # Create Escape operator
+        self.escape_op = Escape(
+            child=left_child, 
+            distance_matrix=distance_matrix,
+            d1=d2,
+            d2=distance_domain_max,
+            graph_nodes=graph_nodes,
+            distance_domain_min=distance_domain_min,
+            distance_domain_max=distance_domain_max
+        )
+
+    def __str__(self) -> str:
+        return f"somewhere_[{self.d1},{self.d2}] ( {self.child} )"
+
+    def _boolean(self, x: Tensor) -> Tensor:
+        
+        s1 = self.left_child._boolean(x).squeeze()
+        
+        reach_part = 1.0 - self.reach_op._boolean(x).squeeze()
+        
+        escape_part = 1.0 - self.escape_op._boolean(x).squeeze()
+        
+        result = torch.minimum(s1, torch.minimum(reach_part, escape_part))
+        return result.unsqueeze(0).unsqueeze(-1)
+
+    def _quantitative(self, x: Tensor, normalize: bool = False) -> Tensor:
+        
+        s1 = self.left_child._quantitative(x).squeeze()
+        
+        reach_part = - self.reach_op._quantitative(x).squeeze()
+        
+        escape_part = - self.escape_op._quantitative(x).squeeze()
+        
+        result = torch.minimum(s1, torch.minimum(reach_part, escape_part))
+        return result.unsqueeze(0).unsqueeze(-1)
