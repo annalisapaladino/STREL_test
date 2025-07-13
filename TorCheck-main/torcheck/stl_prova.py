@@ -3,7 +3,7 @@
 
 # ==============================================================================
 # Temporary Version with distance_matrix... more updates to be done
-# you can find the testing for this versione in router_test.ipynb
+# you can find the testing for this version in router_test.ipynb
 # ==============================================================================
 
 # ==============================================================================
